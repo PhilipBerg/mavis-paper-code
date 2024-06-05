@@ -11,10 +11,10 @@ if (!require(mavis)) {
   devtools::install_github("PhilipBerg/mavis")
 }
 
-p_load(dplyr, tidyr, stringr, purrr, mavis)
+p_load(dplyr, tidyr, stringr, purrr, mavis, ggplot2)
 
 #### Define functions ####
-baldur_wrapper <- function(data, design, contrast, gam_model, workers) {
+baldur_wrapper <- function(data, design, contrast, gam_model, workers, prior = baldur::empirical_bayes) {
   uncertainty <- data %>%
     mavis::estimate_uncertainty('identifier', design, gam_model)
   gam_model %>%
@@ -24,7 +24,7 @@ baldur_wrapper <- function(data, design, contrast, gam_model, workers) {
       design_matrix = design,
       contrast_matrix = contrast,
       uncertainty_matrix = uncertainty,
-      stan_model = baldur::empirical_bayes,
+      stan_model = prior,
       clusters = workers
     )
 }
@@ -46,7 +46,7 @@ ttest_wrapper <- function(contrast, data) {
 }
 
 # Function for finding alpha used in creating ROC curves for multiple imputation
-find_alpha <- function(results, data, regex, cluster) {
+find_alpha <- function(results, data, regex, cl) {
   tmp <- results$limma_results[[1]] %>%
     filter(comparison == .data$comparison[[1]])
   p <- sum(str_detect(tmp$identifier, regex))
@@ -104,8 +104,8 @@ find_alpha <- function(results, data, regex, cluster) {
 
 # Saving tiff and pdf
 ggsave_wrapper <- function(file_name, width, height = NA){
-  ggsave(paste0(file_name, '.tiff'), width = width, height = height, units = 'in', dpi = 320, compression = 'lzw')
-  ggsave(paste0(file_name, '.pdf'), width = width, height = height, units = 'in', dpi = 320)
+  ggsave(paste0(file_name, '.tiff'), width = width, height = height, units = 'mm', dpi = 320, compression = 'lzw')
+  ggsave(paste0(file_name, '.pdf'), width = width, height = height, units = 'mm', dpi = 320)
 }
 
 
@@ -221,14 +221,15 @@ ups_cont <- matrix(
 full_page <- 178
 half_page <- 86
 color_theme <- set_names(
-  viridisLite::turbo(6, end = .9),
+  viridisLite::turbo(7, end = .9),
   c(
     'GCR-Baldur',
     'GR-Baldur',
     'GR-Limma',
     'GCR-Limma',
     'Limma-trend',
-    't-test'
+    't-test',
+    "Mavis"
   )
 )
 
@@ -237,14 +238,36 @@ workers <- round(parallel::detectCores()/2)
 #### Normalize and partition ####
 ups_norm <- mavis::ups %>%
   psrn("identifier")
+
+imp_pars <- get_imputation_pars(ups_norm, ups_design, workers = workers)
+
 ups_part <- ups_norm %>%
-  single_imputation(ups_design, workers = 10) %>%
-  calculate_mean_sd_trends(ups_design) %>%
-  trend_partitioning(human_design, sd ~ mean * c, eps = c(.2, .9), eps_scale = 'linear')
+  single_imputation(ups_design, imp_pars = imp_pars) %>%
+  calculate_mean_sd_trends(ups_design) 
+
+ups_part <- ups_part %>%
+  grid_search(ups_design, n_h1 = 30, n_h2 = 30, formula = c(sd ~ mean + c), workers = workers, h1_prop = c(1e-5, .05), h2_prop = c(1e-5, .05))
+
+ups_part <- ups_part$clustered_data[[1]]
+
+ups_part_na <- ups_norm %>%
+  calculate_mean_sd_trends(ups_design) %>% 
+  select(-sd, sd = sd_p) %>% 
+  grid_search(ups_design, n_h1 = 30, n_h2 = 30, formula = c(sd ~ mean + c), workers = workers, h1_prop = c(1e-5, .05), h2_prop = c(1e-5, .05))
+
+ups_part_na <- ups_part_na$clustered_data[[1]] %>% 
+  rename(c_p = c) %>% 
+  calculate_mean_sd_trends(ups_design)
+
+ups_part_na <- ups_part_na %>% 
+  grid_search(ups_design, n_h1 = 30, n_h2 = 30, formula = c(sd ~ mean + c), workers = workers, h1_prop = c(1e-5, .05), h2_prop = c(1e-5, .05))
+
+ups_part_na <- ups_part_na$clustered_data[[1]] 
+
 
 #### Fit regression models ####
 gr  <- fit_gamma_regression(ups_part)
-gcr <- fit_gamma_regression(ups_part, sd ~ mean*c)
+gcr <- fit_gamma_regression(ups_part, sd ~ mean + c)
 
 #### Run Baldur and t-test ####
 ups_gr_baldur  <- baldur_wrapper(ups_part, ups_design, ups_cont, gr,  workers)
@@ -267,32 +290,65 @@ multidplyr::cluster_library(
 multidplyr::cluster_copy(cl,
                          "calc_tpr_fpr"
 )
-ups_trend_roc <- multiple_imputation_and_limma(
+ups_trend <- multiple_imputation_and_limma(
   ups_norm, ups_design, ups_contrast, 1000, workers, "identifier", TRUE,
-  FALSE, FALSE
-) %>%
+  FALSE, FALSE, imp_pars = imp_pars
+) 
+
+ups_trend_roc <- ups_trend %>%
   find_alpha(ups_norm, "UPS", cl) %>%
   mutate(
     method = "Limma-trend"
   )
-ups_gr_limma_roc <- multiple_imputation_and_limma(
+ups_trend <- ups_trend %>% 
+  extract_results(ups_norm, .05, 0, "fdr", "identifier")
+
+ups_gr_limma <- multiple_imputation_and_limma(
   ups_norm, ups_design, ups_contrast, 1000, workers, "identifier", TRUE,
-  TRUE, FALSE, sd_p ~ mean, sd ~ mean
-) %>%
+  TRUE, FALSE, sd_p ~ mean, sd_p ~ mean, imp_pars = imp_pars
+) 
+
+ups_gr_limma_roc <- ups_gr_limma %>%
   find_alpha(ups_norm, "UPS", cl) %>%
   mutate(
     method = "GR-Limma"
   )
-ups_gcr_limma_roc <- multiple_imputation_and_limma(
-  ups_norm, ups_design, ups_contrast, 1000, workers, "identifier", TRUE,
-  TRUE, FALSE, sd_p ~ mean, sd ~ mean*c
-) %>%
-  find_alpha(ups_norm, "UPS", cl) %>%
+ups_gr_limma <- ups_gr_limma %>% 
+  extract_results(ups_norm, .05, 0, "fdr", "identifier")
+
+ups_gcr_limma <- multiple_imputation_and_limma(
+  ups_part_na, ups_design, ups_contrast, 1000, workers, "identifier", TRUE,
+  TRUE, FALSE, sd_p ~ mean, sd ~ mean + c, imp_pars = imp_pars
+)
+
+ups_gcr_limma_roc <- ups_gcr_limma %>%
+  find_alpha(ups_part_na, "UPS", cl) %>%
   mutate(
     method = "GCR-Limma"
   )
+ups_gcr_limma <- ups_gcr_limma %>% 
+  extract_results(ups_norm, .05, 0, "fdr", "identifier")
 rm(cl)
 gc()
+
+#### Run Mavis ####
+stan_mod <- cmdstanr::cmdstan_model("~/Downloads/mavis.stan")
+
+data_regex <- "ups_.*(limma|baldur|trend)$"
+
+ups_all_err <- mget(ls(pattern = data_regex)) %>% 
+  map(
+    select, 1, comparison, contains('err'), matches('(median_|^)p_val')
+  ) %>% 
+  imap(~ rename(.x, !!.y := 3)) %>% 
+  reduce(left_join, by = c("identifier", "comparison")) %>% 
+  split.data.frame(.$comparison) %>% 
+  map(select, -comparison)
+
+
+ups_mavis <- ups_all_err %>% 
+  imap(mavis) %>% 
+  bind_rows()
 
 #### Performance ####
 cl <- multidplyr::new_cluster(workers)
@@ -321,6 +377,10 @@ ups_gcr_baldur_roc <- create_roc("err", ups_gcr_baldur, "UPS", cl = cl) %>%
 ups_ttest_roc      <- create_roc("p_val", ups_ttest,    "UPS", cl = cl) %>%
   mutate(
     method = 't-test'
+  )
+ups_mavis_roc <- create_roc('mavis', ups_mavis, "UPS", cl) %>%
+  mutate(
+    method = 'Mavis'
   )
 rm(cl)
 gc()
@@ -355,7 +415,7 @@ ups_roc %>%
   theme_classic() +
   geom_text(data = ups_auroc,
             aes(FPR, TPR, label = round(auROC, 3)),
-            size = 2.8,
+            size = 2.25,
             show.legend = F
   ) +
   scale_color_manual('Method',
@@ -369,11 +429,12 @@ ups_roc %>%
   scale_y_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
   scale_x_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
   theme(
-    legend.position = c(.925, .2),
+    legend.position = c(.925, .225),
     plot.margin = margin(r = 2),
     legend.direction = 'horizontal',
     legend.key.size = unit(.2, "cm"),
-    legend.spacing.y = unit(.01, 'cm')
+    legend.spacing.y = unit(.01, 'cm'),
+    legend.background = element_blank()
   ) +
   labs(
     y = 'True Positive Rate',
@@ -384,6 +445,7 @@ ups_roc %>%
 ggsave_wrapper('ups_roc', full_page, 1/2*full_page)
 
 ups_roc %>%
+  filter(between(alpha, 0, .2)) %>%
   group_by(comparison, method) %>%
   arrange(alpha) %>%
   ggplot(aes(alpha, MCC, color = method)) +
@@ -399,10 +461,10 @@ ups_roc %>%
                        override.aes = list(linewidth = 1)
                      )
   ) +
-  scale_y_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
-  scale_x_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_y_continuous(breaks = seq(0, 1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_x_continuous(breaks = seq(0, 1, .05), labels = function(x) ifelse(x == 0, "0", x)) +
   theme(
-    legend.position = c(.925, .895),
+    legend.position = c(.925, .175),
     plot.margin = margin(),
     legend.direction = 'horizontal',
     legend.background = element_blank(),
@@ -413,16 +475,19 @@ ups_roc %>%
     x = expression(alpha),
     y = 'Matthews Correlation Coefficient'
   ) +
-  facet_grid(. ~ comparison)
+  facet_grid(. ~ comparison) +
+  coord_cartesian(xlim = c(0, .2))
 ggsave_wrapper('ups_mcc', full_page, 1/2*full_page)
 
 ups_roc %>%
-  pivot_longer(c(TPR, FPR, precision)) %>%
-  mutate(
-    name = str_replace(name, 'pre', 'Pre'),
-    name = str_replace(name, 'FPR', 'False Positive Rate'),
-    name = str_replace(name, 'TPR', 'True Positive Rate')
-  ) %>%
+  filter(between(alpha, 0, .2)) %>%
+  pivot_longer(c(TP, FP, precision)) %>% 
+  # pivot_longer(c(TPR, FPR, precision)) %>%
+  # mutate(
+  #   name = str_replace(name, 'pre', 'Pre'),
+  #   name = str_replace(name, 'FPR', 'False Positive Rate'),
+  #   name = str_replace(name, 'TPR', 'True Positive Rate')
+  # ) %>%
   group_by(comparison, method) %>%
   arrange(alpha) %>%
   ggplot(aes(alpha, value, color = method)) +
@@ -438,10 +503,9 @@ ups_roc %>%
                        override.aes = list(linewidth = 1)
                      )
   ) +
-  scale_y_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
-  scale_x_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_x_continuous(breaks = seq(0, 1, .05), labels = function(x) ifelse(x == 0, "0", x)) +
   theme(
-    legend.position = c(.92, .075),
+    legend.position = c(.92, .08),
     plot.margin = margin(),
     legend.direction = 'horizontal',
     legend.key.size = unit(.25, "cm"),
@@ -451,5 +515,5 @@ ups_roc %>%
     x = expression(alpha),
     y = 'True-, False- Positive Rate, Precision'
   ) +
-  facet_grid(name ~ comparison)
+  facet_grid(name ~ comparison, scales = 'free_y')
 ggsave_wrapper('ups_decomposed', width = full_page, height = full_page)

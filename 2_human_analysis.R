@@ -4,7 +4,7 @@ library(pacman)
 p_load(dplyr, multidplyr, magrittr ,purrr, tidyr, ggplot2, mavis, rlang, stringr)
 
 ### Functions ####
-data <- read.csv(file = "human_data_without_control.csv", sep= "\t", stringsAsFactors = F)%>%
+data <- read.csv(file = "/home/pb1015/mavis-paper-code/human_data_without_control.csv", sep= "\t", stringsAsFactors = F)%>%
   filter(
     identifier %in% readr::read_csv("human_ids.csv")$identifier # Put correct path to file here
   )
@@ -37,7 +37,7 @@ find_alpha <- function(results, data, cluster) {
     mutate(
       tmp = map(value,
                 ~ extract_results(
-                  results,
+                  results, human_design,
                   data,
                   alpha = .x,
                   abs_lfc = 0,
@@ -186,9 +186,9 @@ human_contrast <- limma::makeContrasts(
 ## Baldur contrast
 human_cont <- matrix(
   c(
-    -1, 1, 0,
-    -1, 0, 1,
-    0, -1, 1
+    1, -1, 0,
+    1, 0, -1,
+    0, 1, -1
   ), nrow = 3
 )
 
@@ -225,12 +225,22 @@ human <- data %>%
 
 
 ## Run single imputation with one trend
+## Edits: Philip Berg //BEGIN
 human_sin <- human %>%
   single_imputation(human_design, workers = workers) %>%
   ## Update M-V trends
-  calculate_mean_sd_trends(human_design)%>%
-  mavis::trend_partitioning(human_design, eps = c(.2, .9), eps_scale = 'linear')
-  print("human_sin")
+  calculate_mean_sd_trends(human_design)
+
+human_grid <- human_sin %>%
+  grid_search(human_design, workers = workers, n_h1 = 25, n_h2 = 25, formula = c(sd ~ mean + c), h1_prop = c(1e-4, .1), h2_prop = c(1e-4, .1))
+human_sin <- human_grid$clustered_data[[1]]
+
+human_grid_na <- human %>% 
+  grid_search(human_design, workers = workers, n_h1 = 25, n_h2 = 25, formula = c(sd ~ mean + c), h1_prop = c(1e-4, .1), h2_prop = c(1e-4, .1))
+human <- human_grid_na$clustered_data[[1]]
+
+## Edits: Philip Berg //END
+print("human_sin")
 save(human_sin, file='human_sin.RData')
 
 ## Gamma regressions for single trend imputation
@@ -242,7 +252,9 @@ save(gam_sin_sin, file='human_p_gam_sin_sin.RData')
 
 # Gamma regressions for one trend
 gam_sin_mix <- human_sin %>%
-  fit_gamma_regression(sd ~ mean*c)
+  ## Edits: Philip Berg //BEGIN
+  fit_gamma_regression(sd ~ mean+c)
+  ## Edits: Philip Berg //END
 print("gam_sin_mix")
 save(gam_sin_mix, file='human_p_gam_sin_mix.RData')
 
@@ -260,6 +272,8 @@ save(bald_sin_mix, file='human_p_bald_sin_mix.RData')
 ### Multiple imputation and limma
 ## Run mixture
 
+imp_pars <- mavis::get_imputation_pars(human, human_design, workers = workers)
+
 limma_sin_mix <- multiple_imputation_and_limma(
   data = human,
   design = human_design,
@@ -270,8 +284,11 @@ limma_sin_mix <- multiple_imputation_and_limma(
   .robust = T,
   weights = T,
   plot_trend = F,
-  formula_weights =  sd ~ mean * c
+  formula_weights =  sd ~ mean + c,
+  imp_pars = imp_pars
 )
+
+
 print("limma_sin_mix")
 save(limma_sin_mix, file='human_p_limma_sin_mix.RData')
 
@@ -285,8 +302,12 @@ limma_sin_sin <- multiple_imputation_and_limma(
   .robust = T,
   weights = T,
   plot_trend = F,
-  formula_weights =  sd ~ mean
+  formula_weights =  sd ~ mean,
+  imp_pars = imp_pars
 )
+limma_sin_sin_results <- limma_sin_sin %>% 
+  extract_results(human, abs_lfc = 0, id_col = "identifier")
+
 print("limma_sin_sin")
 save(limma_sin_sin, file='human_p_limma_sin_sin.RData')
 
@@ -302,7 +323,11 @@ limma_trend_sin <- multiple_imputation_and_limma(
   .robust = T,
   weights = F,
   plot_trend = F,
+  imp_pars = imp_pars
 )
+limma_trend_sin_results <- limma_trend_sin %>% 
+  extract_results(human, abs_lfc = 0, id_col = "identifier")
+
 print("limma_trend_sin")
 save(limma_trend_sin, file='human_p_limma_trend_sin.RData')
 
@@ -343,11 +368,7 @@ gc()
 ### t-test
 ## single
 sin_t_test <- map(colnames(human_contrast), ttest_wrapper, human_sin) %>%
-  bind_rows() %>%
-  group_by(comparison) %>%
-    mutate(
-      p_val = p.adjust(p_val, 'fdr')
-    ) %>%
+  bind_rows() %>% 
   ungroup()
 
 ### Performance ####
@@ -430,7 +451,6 @@ human_roc <- bind_rows(
     comparison = str_replace(comparison, 'Vs', 'vs'),
     method = str_replace_all(method, set_names(c("GCR", "GR"),c("Mix", "Gamma")))
   ) %>%
-
   # Remove the ones with all values missing
   # for baldur without imputation
   filter(alpha < 2) %>%
@@ -439,11 +459,11 @@ human_roc <- bind_rows(
   # Split on the imputation methods
   split.data.frame(.$imputation)
 
-human_roc<- mutate(human_roc$`Single-Imputation`, comparison=str_replace(comparison, 'A200 vs A150', 'A150 vs A200'))
-human_roc<-mutate(human_roc, comparison=str_replace(comparison, 'A150 vs A100', 'A100 vs A150'))
-human_roc<-mutate(human_roc, comparison=str_replace(comparison, 'A200 vs A100', 'A100 vs A200'))
+human_roc <- mutate(human_roc$`Single-Imputation`, comparison=str_replace(comparison, 'A200 vs A150', 'A150 vs A200'))
+human_roc <- mutate(human_roc, comparison=str_replace(comparison, 'A150 vs A100', 'A100 vs A150'))
+human_roc <- mutate(human_roc, comparison=str_replace(comparison, 'A200 vs A100', 'A100 vs A200'))
 
-human_roc<-list(human_roc=human_roc)
+human_roc <- list(human_roc=human_roc)
 
 
 # Get the auroc
@@ -461,16 +481,21 @@ human_auroc <- human_roc %>%
       )
   )
 
+
+dir.create("roc_data", FALSE)
+save(human_roc, human_auroc, file = "roc_data/yeast_roc.RData")
+
 ### Plotting ####
 color_theme <- set_names(
-  viridisLite::turbo(6, end = .9),
+  viridisLite::turbo(7, end = .9),
   c(
     'GCR-Baldur',
     'GR-Baldur',
     'GR-Limma',
     'GCR-Limma',
     'Limma-trend',
-    't-test'
+    't-test',
+    "Mavis"
   )
 )
 

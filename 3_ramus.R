@@ -42,13 +42,15 @@ ttest_wrapper <- function(contrast, data) {
     group_by(identifier) %>%
     mutate(
       comparison = str_flatten(comp, ' vs '),
-      p_val = t.test(across(contains(comp[1])), across(contains(comp[2])), var.equal = T)$p.value
+      p_val = t.test(across(contains(comp[1])), across(contains(comp[2])), var.equal = T)$p.value,
+      lfc   = t.test(across(contains(comp[1])), across(contains(comp[2])), var.equal = T)$estimate[1] -
+        t.test(across(contains(comp[1])), across(contains(comp[2])), var.equal = T)$estimate[2]
     ) %>%
     group_by(comparison) %>%
     mutate(
       p_val = p.adjust(p_val, 'fdr')
     ) %>%
-    select(identifier, comparison, p_val)
+    select(identifier, comparison, p_val, lfc)
 }
 
 # Function for finding alpha used in creating ROC curves for multiple imputation
@@ -110,8 +112,8 @@ find_alpha <- function(results, data, regex, cluster) {
 
 # Saving tiff and pdf
 ggsave_wrapper <- function(file_name, width, height = NA){
-  ggsave(paste0(file_name, '.tiff'), width = width, height = height, units = 'in', dpi = 320, compression = 'lzw')
-  ggsave(paste0(file_name, '.pdf'), width = width, height = height, units = 'in', dpi = 320)
+  ggsave(paste0(file_name, '.tiff'), width = width, height = height, units = 'mm', dpi = 320, compression = 'lzw')
+  ggsave(paste0(file_name, '.pdf'), width = width, height = height, units = 'mm', dpi = 320)
 }
 
 
@@ -294,14 +296,15 @@ ramus_cont <- combn(1:9, 2) %>%
 full_page <- 178
 half_page <- 86
 color_theme <- set_names(
-  viridisLite::turbo(6, end = .9),
+  viridisLite::turbo(7, end = .9),
   c(
     'GCR-Baldur',
     'GR-Baldur',
     'GR-Limma',
     'GCR-Limma',
     'Limma-trend',
-    't-test'
+    't-test',
+    "Mavis"
   )
 )
 
@@ -337,14 +340,28 @@ if (!file.exists('ramus_clean.csv')) {
 ramus_norm <- readr::read_csv('ramus_clean.csv') %>%
   rename_with(~paste0('condi', rep(1:9, each = 3), '_', rep(1:3, lenght.out = 9*3)), where(is.numeric)) %>%
   psrn(load_info = F, id_col = 'identifier')
+
 ramus_part <- ramus_norm %>%
-  single_imputation(ramus_design, workers = 10) %>%
-  calculate_mean_sd_trends(ramus_design) %>%
-  trend_partitioning(ramus_design, sd ~ mean * c, eps = c(.1, .4), eps_scale = 'log-linear')
+  single_imputation(ramus_design, workers = workers) %>%
+  calculate_mean_sd_trends(ramus_design)
+
+ramus_part <- ramus_norm %>%
+  single_imputation(ramus_design, workers = workers) %>%
+  calculate_mean_sd_trends(ramus_design) 
+
+ramus_opti <- ramus_part %>%
+  grid_search(ramus_design, n_h1 = 20, n_h2 = 20, formula = c(sd ~ mean + c), g = "linear")
+
+
+ramus_part <- ramus_part %>%
+  iterater(ramus_design, sd ~ mean + c, c(ramus_opti$h1[1], ramus_opti$h2[1]), "linear", verbose = 1, lambda = 1, penalty = p, plot = T) %>% 
+  use_series(data)
+
+ramus_norm$c <- ramus_part$c
 
 #### Fit regression models ####
 gr  <- fit_gamma_regression(ramus_part)
-gcr <- fit_gamma_regression(ramus_part, sd ~ mean*c)
+gcr <- fit_gamma_regression(ramus_part, sd ~ mean + c)
 
 #### Run Baldur and t-test ####
 ramus_gr_baldur  <- baldur_wrapper(ramus_part, ramus_design, ramus_cont, gr,  workers)
@@ -367,32 +384,102 @@ multidplyr::cluster_library(
 multidplyr::cluster_copy(cl,
                          "calc_tpr_fpr"
 )
-ramus_trend_roc <- multiple_imputation_and_limma(
+ramus_trend <- multiple_imputation_and_limma(
   ramus_norm, ramus_design, ramus_contrast, 1000, workers, "identifier", TRUE,
   FALSE, FALSE
-) %>%
+) 
+
+ramus_trend_roc <- ramus_trend %>%
   find_alpha(ramus_norm, "UPS", cl) %>%
   mutate(
     method = "Limma-trend"
   )
-ramus_gr_limma_roc <- multiple_imputation_and_limma(
+ramus_trend <- ramus_trend %>% 
+  extract_results(ramus_norm, .05, 0, "fdr", "identifier")
+
+ramus_gr_limma <- multiple_imputation_and_limma(
   ramus_norm, ramus_design, ramus_contrast, 1000, workers, "identifier", TRUE,
   TRUE, FALSE, sd_p ~ mean, sd ~ mean
-) %>%
+) 
+
+ramus_gr_limma_roc <- ramus_gr_limma %>%
   find_alpha(ramus_norm, "UPS", cl) %>%
   mutate(
     method = "GR-Limma"
   )
-ramus_gcr_limma_roc <- multiple_imputation_and_limma(
+ramus_gr_limma <- ramus_gr_limma %>% 
+  extract_results(ramus_norm, .05, 0, "fdr", "identifier")
+
+ramus_gcr_limma <- multiple_imputation_and_limma(
   ramus_norm, ramus_design, ramus_contrast, 1000, workers, "identifier", TRUE,
   TRUE, FALSE, sd_p ~ mean, sd ~ mean*c
-) %>%
+) 
+
+ramus_gcr_limma_roc <- ramus_gcr_limma %>%
   find_alpha(ramus_norm, "UPS", cl) %>%
   mutate(
     method = "GCR-Limma"
   )
+ramus_gcr_limma <- ramus_gcr_limma %>% 
+  extract_results(ramus_norm, .05, 0, "fdr", "identifier")
 rm(cl)
 gc()
+
+#### Run Mavis ####
+stan_mod <- cmdstanr::cmdstan_model("~/Downloads/mavis.stan")
+
+data_regex <- "ramus_.*(limma|baldur|ttest)$"
+
+ramus_all_err <- mget(ls(pattern = data_regex)) %>% 
+  map(
+    select, 1, comparison, contains('err'), matches('(median_|^)p_val')
+  ) %>% 
+  imap(~ rename(.x, !!.y := 3)) %>% 
+  reduce(left_join, by = c("identifier", "comparison")) %>% 
+  split.data.frame(.$comparison) %>% 
+  map(select, -comparison)
+
+weights <- mget(ls(pattern = data_regex)) %>%
+  map(ungroup) %>%
+  map(select, identifier, comparison, any_of(c("err", "p_val", "median_p_val", "median_lfc", "lfc"))) %>%
+  map(~ split.data.frame(.x, .x$comparison)) %>% 
+  map_depth(2,
+            ~ cor(abs(.x[[3]]), abs(.x[[4]]), method = "spear")
+  ) %>% 
+  map(unlist)
+
+weights <- names(weights[[1]]) %>% 
+  setNames(., .) %>% 
+  map(
+    ~ lapply(weights, `[[`, .x)
+  ) %>% 
+  map(unlist) %>% 
+  map(
+    ~ .x/sum(.x)
+  )
+
+samp <- ramus_all_err %>% 
+  map(make_stan_input) %>% 
+  map2(weights, add_weights) %>% 
+  map(stan_mod$sample, parallel_chains = 4, iter_warmup = 500, iter_sampling = 500)
+
+mu_smry <- samp %>% 
+  map(~ .x$summary("mu"))
+
+post_means <- mu_smry %>% 
+  map(use_series, mean) %>% 
+  map(multiply_by, -1) %>% 
+  map(add, 1)
+
+ramus_mavis <- map2(ramus_all_err, post_means,
+                    ~ .x[1] %>% 
+                      mutate(
+                        p_val = .y
+                      )
+) %>% 
+  imap(~ mutate(.x, comparison = .y)) %>% 
+  bind_rows()
+
 
 #### Performance ####
 cl <- multidplyr::new_cluster(workers)
@@ -420,6 +507,10 @@ ramus_gcr_baldur_roc <- create_roc("err", ramus_gcr_baldur, "UPS", cl = cl) %>%
 ramus_ttest_roc      <- create_roc("p_val", ramus_ttest,    "UPS", cl = cl) %>%
   mutate(
     method = 't-test'
+  )
+ramus_mavis_roc <- create_roc('p_val', ramus_mavis, "UPS", cl) %>%
+  mutate(
+    method = 'Mavis'
   )
 rm(cl)
 gc()
@@ -465,8 +556,8 @@ ramus_roc %>%
                        override.aes = list(linewidth = 1)
                      )
   ) +
-  scale_y_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
-  scale_x_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_y_continuous(breaks = seq(0, 1, .5), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_x_continuous(breaks = seq(0, 1, .5), labels = function(x) ifelse(x == 0, "0", x)) +
   theme(
     legend.position = "bottom",
     plot.margin = margin(r = 2),
@@ -484,6 +575,7 @@ ramus_roc %>%
 ggsave_wrapper('ramus_roc', full_page, full_page)
 
 ramus_roc %>%
+  filter(between(alpha, 0, .2)) %>%
   group_by(comparison, method) %>%
   arrange(alpha) %>%
   ggplot(aes(alpha, MCC, color = method)) +
@@ -499,11 +591,11 @@ ramus_roc %>%
                        override.aes = list(linewidth = 1)
                      )
   ) +
-  scale_y_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
-  scale_x_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_y_continuous(breaks = seq(0, 1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_x_continuous(breaks = seq(0, 1,.1), labels = function(x) ifelse(x == 0, "0", x)) +
   theme(
     legend.position = "bottom",
-    plot.margin = margin(),
+    plot.margin = margin(r = 3, l = 1),
     legend.direction = 'horizontal',
     legend.background = element_blank(),
     legend.key.size = unit(.25, "cm"),
@@ -517,7 +609,7 @@ ramus_roc %>%
 ggsave_wrapper('ramus_mcc', full_page, full_page)
 
 ramus_roc %>%
-  filter(alpha >= 0) %>%
+  filter(between(alpha, 0, .2)) %>%
   group_by(comparison, method) %>%
   arrange(alpha) %>%
   ggplot(aes(alpha, TPR, color = method)) +
@@ -533,11 +625,11 @@ ramus_roc %>%
                        override.aes = list(linewidth = 1)
                      )
   ) +
-  scale_y_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
-  scale_x_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_y_continuous(breaks = seq(0, 1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_x_continuous(breaks = seq(0, 1,.1), labels = function(x) ifelse(x == 0, "0", x)) +
   theme(
     legend.position = "bottom",
-    plot.margin = margin(),
+    plot.margin = margin(r = 3, l = 1),
     legend.direction = 'horizontal',
     legend.key.size = unit(.25, "cm"),
     legend.background = element_blank()
@@ -550,7 +642,7 @@ ramus_roc %>%
 ggsave_wrapper('ramus_tpr', width = full_page, height = full_page)
 
 ramus_roc %>%
-  filter(alpha >= 0) %>%
+  filter(between(alpha, 0, .2)) %>%
   group_by(comparison, method) %>%
   arrange(alpha) %>%
   ggplot(aes(alpha, FPR, color = method)) +
@@ -566,11 +658,11 @@ ramus_roc %>%
                        override.aes = list(linewidth = 1)
                      )
   ) +
-  scale_y_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
-  scale_x_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_y_continuous(breaks = seq(0, 1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_x_continuous(breaks = seq(0, 1,.1), labels = function(x) ifelse(x == 0, "0", x)) +
   theme(
     legend.position = "bottom",
-    plot.margin = margin(),
+    plot.margin = margin(r = 3, l = 1),
     legend.direction = 'horizontal',
     legend.key.size = unit(.25, "cm"),
     legend.background = element_blank()
@@ -584,7 +676,7 @@ ggsave_wrapper('ramus_fpr', width = full_page, height = full_page)
 
 
 ramus_roc %>%
-  filter(alpha >= 0) %>%
+  filter(between(alpha, 0, .2)) %>%
   group_by(comparison, method) %>%
   arrange(alpha) %>%
   ggplot(aes(alpha, precision, color = method)) +
@@ -600,11 +692,11 @@ ramus_roc %>%
                        override.aes = list(linewidth = 1)
                      )
   ) +
-  scale_y_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
-  scale_x_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_y_continuous(breaks = seq(0, 1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_x_continuous(breaks = seq(0, 1,.1), labels = function(x) ifelse(x == 0, "0", x)) +
   theme(
     legend.position = "bottom",
-    plot.margin = margin(),
+    plot.margin = margin(r = 3, l = 1),
     legend.direction = 'horizontal',
     legend.key.size = unit(.25, "cm"),
     legend.background = element_blank()

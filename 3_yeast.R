@@ -11,9 +11,32 @@ if (!require(mavis)) {
   devtools::install_github("PhilipBerg/mavis")
 }
 
-p_load(dplyr, tidyr, purrr, mavis)
+p_load(dplyr, tidyr, purrr, mavis, magrittr, ggplot2)
 
 #### Define functions ####
+make_stan_input <- function(data) {
+  N <- nrow(data)
+  data <- data %>% 
+    select(where(is.numeric)) %>% 
+    mutate(
+      across(where(is.numeric), ~ if_else(. != 0, ., min(.[. != 0])))
+    )
+  M <- ncol(data)
+  list(
+    N = N,
+    M = M,
+    y = 
+      matrix(
+        unlist(data), N, M
+      )
+  )
+}
+
+add_weights <- function(stan_input, weights) {
+  stan_input$tau <- weights
+  stan_input
+}
+
 baldur_wrapper <- function(data, design, contrast, gam_model, workers) {
   uncertainty <- data %>%
     mavis::estimate_uncertainty('identifier', design, gam_model)
@@ -35,13 +58,15 @@ ttest_wrapper <- function(contrast, data) {
     group_by(identifier) %>%
     mutate(
       comparison = str_flatten(comp, ' vs '),
-      p_val = t.test(across(contains(comp[1])), across(contains(comp[2])), var.equal = T)$p.value
+      p_val = t.test(across(contains(comp[1])), across(contains(comp[2])), var.equal = T)$p.value,
+      lfc   = t.test(across(contains(comp[1])), across(contains(comp[2])), var.equal = T)$estimate[1] -
+        t.test(across(contains(comp[1])), across(contains(comp[2])), var.equal = T)$estimate[2]
     ) %>%
     group_by(comparison) %>%
     mutate(
       p_val = p.adjust(p_val, 'fdr')
     ) %>%
-    select(identifier, comparison, p_val)
+    select(identifier, comparison, p_val, lfc)
 }
 
 # Function for finding alpha used in creating ROC curves for multiple imputation
@@ -94,8 +119,8 @@ find_alpha <- function(results, data, regex, cluster) {
 
 # Saving tiff and pdf
 ggsave_wrapper <- function(file_name, width, height = NA){
-  ggsave(paste0(file_name, '.tiff'), width = width, height = height, units = 'in', dpi = 320, compression = 'lzw')
-  ggsave(paste0(file_name, '.pdf'), width = width, height = height, units = 'in', dpi = 320)
+  ggsave(paste0(file_name, '.tiff'), width = width, height = height, units = 'mm', dpi = 320, compression = 'lzw')
+  ggsave(paste0(file_name, '.pdf'), width = width, height = height, units = 'mm', dpi = 320)
 }
 
 
@@ -198,14 +223,15 @@ yeast_cont <- matrix(c(1, -1), 2)
 full_page <- 178
 half_page <- 86
 color_theme <- set_names(
-  viridisLite::turbo(6, end = .9),
+  viridisLite::turbo(7, end = .9),
   c(
     'GCR-Baldur',
     'GR-Baldur',
     'GR-Limma',
     'GCR-Limma',
     'Limma-trend',
-    't-test'
+    't-test',
+    "Mavis"
   )
 )
 
@@ -214,14 +240,25 @@ workers <- round(parallel::detectCores()/2)
 #### Normalize and partition ####
 yeast_norm <- mavis::yeast %>%
   psrn("identifier")
+
 yeast_part <- yeast_norm %>%
-  single_imputation(yeast_design, workers = 10) %>%
-  calculate_mean_sd_trends(yeast_design) %>%
-  trend_partitioning(yeast_design, sd ~ mean * c, eps = c(.1, .4), eps_scale = 'log-linear')
+  single_imputation(yeast_design, workers = workers) %>%
+  calculate_mean_sd_trends(yeast_design) 
+
+yeast_part <- yeast_part %>%
+  grid_search(yeast_design, n_h1 = 30, n_h2 = 30, formula = c(sd ~ mean + c), workers = workers, h1_prop = c(12e-3, .01), h2_prop = c(.0025, .07))
+
+yeast_part <- yeast_part$clustered_data[[1]]
+
+yeast_part_na <- yeast_norm %>% 
+  grid_search(yeast_design, n_h1 = 25, n_h2 = 25, formula = c(sd ~ mean + c), workers = workers)
+  
+yeast_part_na <- yeast_part_na$clustered_data[[1]]
+
 
 #### Fit regression models ####
 gr  <- fit_gamma_regression(yeast_part)
-gcr <- fit_gamma_regression(yeast_part, sd ~ mean*c)
+gcr <- fit_gamma_regression(yeast_part, sd ~ mean+c)
 
 #### Run Baldur and t-test ####
 yeast_gr_baldur  <- baldur_wrapper(yeast_part, yeast_design, yeast_cont, gr,  workers)
@@ -243,32 +280,64 @@ multidplyr::cluster_library(
 multidplyr::cluster_copy(cl,
                          "calc_tpr_fpr"
 )
-yeast_trend_roc <- multiple_imputation_and_limma(
+yeast_trend <- multiple_imputation_and_limma(
   yeast_norm, yeast_design, yeast_contrast, 1000, workers, "identifier", TRUE,
   FALSE, FALSE
-) %>%
+) 
+
+yeast_trend_roc <- yeast_trend %>%
   find_alpha(yeast_norm, "YEAST", cl) %>%
   mutate(
     method = "Limma-trend"
   )
-yeast_gr_limma_roc <- multiple_imputation_and_limma(
+yeast_trend <- yeast_trend %>% 
+  extract_results(alpha = .05, abs_lfc = 0, pcor = "fdr", id_col = "identifier")
+
+yeast_gr_limma <- multiple_imputation_and_limma(
   yeast_norm, yeast_design, yeast_contrast, 1000, workers, "identifier", TRUE,
   TRUE, FALSE, sd_p ~ mean, sd ~ mean
-) %>%
+) 
+
+yeast_gr_limma_roc <- yeast_gr_limma %>%
   find_alpha(yeast_norm, "YEAST", cl) %>%
   mutate(
     method = "GR-Limma"
   )
-yeast_gcr_limma_roc <- multiple_imputation_and_limma(
-  yeast_norm, yeast_design, yeast_contrast, 1000, workers, "identifier", TRUE,
-  TRUE, FALSE, sd_p ~ mean, sd ~ mean*c
-) %>%
+
+yeast_gr_limma <- yeast_gr_limma %>% 
+  extract_results(alpha = .05, abs_lfc = 0, pcor = "fdr", id_col = "identifier")
+
+yeast_gcr_limma <- multiple_imputation_and_limma(
+  yeast_part_na, yeast_design, yeast_contrast, 1000, workers, "identifier", TRUE,
+  TRUE, FALSE, sd_p ~ mean, sd ~ mean+c
+) 
+
+yeast_gcr_limma_roc <- yeast_gcr_limma %>%
   find_alpha(yeast_norm, "YEAST", cl) %>%
   mutate(
     method = "GCR-Limma"
   )
+yeast_gcr_limma <- yeast_gcr_limma %>% 
+  extract_results(alpha = .05, abs_lfc = 0, pcor = "fdr", id_col = "identifier")
+
 rm(cl)
 gc()
+
+#### Run Mavis ####
+data_regex <- "yeast_.*(limma|baldur|trend)$"
+
+
+yeast_all_err <- mget(ls(pattern = data_regex)) %>%
+  map(
+    select, 1, comparison, contains('err'), matches('(median_|^)p_val')
+  ) %>%
+  imap(~ rename(.x, !!.y := 3)) %>%
+  reduce(left_join, by = c("identifier", "comparison")) %>%
+  split.data.frame(.$comparison) %>%
+  map(select, -comparison)
+
+yeast_mavis <- yeast_all_err$`ng50 vs ng100` %>% 
+  mavis()
 
 #### Performance ####
 cl <- multidplyr::new_cluster(workers)
@@ -296,6 +365,10 @@ yeast_gcr_baldur_roc <- create_roc("err", yeast_gcr_baldur, "YEAST", cl = cl) %>
 yeast_ttest_roc      <- create_roc("p_val", yeast_ttest,    "YEAST", cl = cl) %>%
   mutate(
     method = 't-test'
+  )
+yeast_mavis_roc <- create_roc('mavis', yeast_mavis, "YEAST", cl) %>%
+  mutate(
+    method = 'Mavis'
   )
 rm(cl)
 gc()
@@ -356,6 +429,7 @@ yeast_roc %>%
 ggsave_wrapper('yeast_roc', half_page, half_page)
 
 yeast_roc %>%
+  filter(between(alpha, 0, .2)) %>%
   group_by(comparison, method) %>%
   arrange(alpha) %>%
   ggplot(aes(alpha, MCC, color = method)) +
@@ -371,10 +445,10 @@ yeast_roc %>%
                        override.aes = list(linewidth = 1)
                      )
   ) +
-  scale_y_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
-  scale_x_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_y_continuous(breaks = seq(0, 1, .2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_x_continuous(breaks = seq(0, 1, .05), labels = function(x) ifelse(x == 0, "0", x)) +
   theme(
-    legend.position = c(.795, .84),
+    legend.position = c(.795, .24),
     plot.margin = margin(),
     legend.direction = 'horizontal',
     legend.background = element_blank(),
@@ -388,6 +462,7 @@ yeast_roc %>%
 ggsave_wrapper('yeast_mcc', width = half_page, height = half_page)
 
 yeast_roc %>%
+  filter(between(alpha, 0, .2)) %>%
   pivot_longer(c(TPR, FPR, precision)) %>%
   mutate(
     name = str_replace(name, 'pre', 'Pre'),
@@ -409,10 +484,10 @@ yeast_roc %>%
                        override.aes = list(linewidth = 1)
                      )
   ) +
-  scale_y_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
-  scale_x_continuous(breaks = seq(0,1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_y_continuous(breaks = seq(0, 1,.2), labels = function(x) ifelse(x == 0, "0", x)) +
+  scale_x_continuous(breaks = seq(0, 1, .05), labels = function(x) ifelse(x == 0, "0", x)) +
   theme(
-    legend.position = c(.9, .12),
+    legend.position = c(.9, .24),
     plot.margin = margin(),
     legend.direction = 'horizontal',
     legend.key.size = unit(.25, "cm"),

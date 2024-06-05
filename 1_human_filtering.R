@@ -15,7 +15,10 @@ human_str_replace <- c(
   'spike_prop_25' = '1:25'
 )
 
-human <- readxl::read_excel('diaWorkflowResults_allDilutions.xlsx', na = 'NA') %>%
+human_design <- model.matrix(~ 0 + factor(rep(1:3, each = 23)))
+colnames(human_design) <- paste0('spike_prop_', c(25, 12, 6))
+
+human <- readxl::read_excel('../mavis-paper-code/diaWorkflowResults_allDilutions.xlsx', na = 'NA') %>%
   select(identifier = 1, everything(), -2:-24) %>%
   filter(!if_all(-identifier, is.na)) %>%
   rename_with(
@@ -117,12 +120,12 @@ human2 %>%
   select(1) %>%
   readr::write_csv("human_ids.csv")
 
-human_mv_imp <- human_prnn %>%
+human_mv_imp <- human %>%
   calculate_mean_sd_trends(human_design) %>%
   select(mean, sd)
 
-human_imp <- map2(colnames(human_design)[c(1, 1, 2)], colnames(human_design)[c(2, 3, 3)], ~ calc_lfc(human_prnn, .x, .y)) %>%
-  bind_cols(human_prnn, human_mv_imp, .) %>%
+human_imp <- map2(colnames(human_design)[c(1, 1, 2)], colnames(human_design)[c(2, 3, 3)], ~ calc_lfc(human, .x, .y)) %>%
+  bind_cols(human, human_mv_imp, .) %>%
   select(-matches("^spike_prop_[0-9]*_[0-9]*$")) %>%
   mutate(
     class = if_else(str_detect(identifier, "ECOLI"), "TP", "TN") %>%
@@ -143,7 +146,7 @@ human_imp %>%
   theme_bw() +
   facet_grid(name ~ .) +
   theme(legend.position = c(.9, .75), legend.background = element_blank()) +
-  labs(y = expression(Log[2]~Fold~Change), x = expression(bar(X)))
+  labs(y = expression(Log[2]~Fold~Changhuman_impe), x = expression(bar(X)))
 ggsave("imp_human.png", dpi = 600, width = 178, height = 200, units = "mm")
 
 
